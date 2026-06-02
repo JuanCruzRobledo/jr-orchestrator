@@ -3,8 +3,8 @@ name: jr-orchestrator
 description: >
   Thin orchestrator for the project foundation flow. Runs `openspec init`, then
   dispatches each foundation phase to its dedicated sub-skill in §4.2 order:
-  kb-creator → roadmap-generator → find-skill → agent-instruction. Owns the
-  shared state file (.jr-orchestrator-state.json) and the `step` field only.
+  kb-creator → roadmap-generator → find-skill → skill-registry → agent-instruction.
+  Owns the shared state file (.jr-orchestrator-state.json) and the `step` field only.
   Trigger: /jr-orchestrator:init, /jr-orchestrator:kb, /jr-orchestrator:rules,
   /jr-orchestrator:openspec, /jr-orchestrator:devops, /jr-orchestrator:find-skill —
   or when the user wants to start a new project from scratch using the
@@ -44,14 +44,14 @@ You are a **thin orchestrator**. Your ONLY jobs are:
 
 ## Shared State Contract
 
-`.jr-orchestrator-state.json` lives at the project root. Schema **version 2** (frozen — C-13b/c consume this contract).
+`.jr-orchestrator-state.json` lives at the project root. Schema **version 3**. The `kb`/`roadmap`/`skills`/`agents` sections are the frozen contract C-13b/c consume; `registry` was added additively (no C-13b/c sub-skill reads it) and bumped the contract from 2 → 3.
 
-> Note: the `"version": 2` below is the **state-schema contract version** (bump only when the shared state shape changes). It is NOT the skill release version in the frontmatter (`version: "2.0"`) — the two version independently.
+> Note: the `"version": 3` below is the **state-schema contract version** (bump only when the shared state shape changes). It is NOT the skill release version in the frontmatter (`version: "2.0"`) — the two version independently.
 
 ```json
 {
-  "version": 2,
-  "step": "openspec|kb|roadmap|find-skill|agents|done",
+  "version": 3,
+  "step": "openspec|kb|roadmap|find-skill|registry|agents|done",
   "owner": "jr-orchestrator",
   "kb": {
     "created_by": "kb-creator",
@@ -79,6 +79,10 @@ You are a **thin orchestrator**. Your ONLY jobs are:
     "created_by": "agent-instruction",
     "files": ["CLAUDE.md", "AGENTS.md"],
     "reglas_applied": []
+  },
+  "registry": {
+    "created_by": "skill-registry",
+    "file": ".atl/skill-registry.md"
   }
 }
 ```
@@ -92,6 +96,7 @@ You are a **thin orchestrator**. Your ONLY jobs are:
 | `roadmap` | `roadmap-generator` | After CHANGES.md is produced |
 | `skills` | `find-skill` | After recommendations + install |
 | `agents` | `agent-instruction` | After CLAUDE.md/AGENTS.md generated |
+| `registry` | `skill-registry` | After `.atl/skill-registry.md` is built (runs after `find-skill`, before `agent-instruction` — which consumes it) |
 
 **There is NO orchestrator-owned `discovery` section.** The discovery lives inside `state.kb.discovery`, owned by `kb-creator`.
 
@@ -119,6 +124,7 @@ Branch on which command fired:
 | `/jr-orchestrator:openspec` | Step 1 — `openspec init` only |
 | `/jr-orchestrator:devops` | Dispatch `devops-scaffolder` sub-skill (optional, full mode). Sub-skill not yet built — see Foundation flow notes. |
 | `/jr-orchestrator:find-skill` | Dispatch `find-skill` directly |
+| `/jr-orchestrator:registry` | Dispatch `skill-registry` directly (rebuild `.atl/skill-registry.md` after skills change) |
 | No command / direct `Skill` call | Default to full flow (Step 1) |
 
 Before branching: always load and apply resume logic above.
@@ -196,13 +202,31 @@ After completion: confirm `CHANGES.md` exists. Update state: `step = "find-skill
 Skill("find-skill")
 ```
 
-After completion: update state: `step = "agents"`.
+After completion: update state: `step = "registry"`.
 
-### Phase 4: agent-instruction (LAST — needs KB + installed skills)
+### Phase 4: skill-registry (after find-skill — feeds both agent-instruction AND the SDD orchestrator)
 
-**Why last**: `agent-instruction` builds the Navigation Map (Mapa de Navegación) referencing all KB files (`state.kb.files`) and the installed skills list (`state.skills.installed`). It also applies applicable rule snippets (`reglas/*.md`). Both inputs are only available after Phases 1 and 3 complete.
+**Why here — after `find-skill`, before `agent-instruction`**: the registry is a build-time scan of every installed skill (it reads each `SKILL.md` and distills compact rules). It MUST run AFTER `find-skill` — that phase *installs* the domain skills, and `skill-registry` *scans* them; run it earlier and it scans a directory missing the skills about to be installed. And it MUST run BEFORE `agent-instruction` — Phase 5 consumes `.atl/skill-registry.md` as its single source of truth for which skills exist (instead of re-scanning the filesystem), so the registry has to exist first. One scan, one source of truth.
 
-**Input consumed**: `state.kb.discovery` + `state.kb.files` (reads `knowledge-base/`) + `state.skills.installed` + applicable rule snippets.
+**Why it matters**: without this phase the project is founded with NO `.atl/skill-registry.md`. The SDD orchestrator's Skill Resolver Protocol then finds no registry, falls back to `.agents/SKILLS.md` (which nothing writes), and every sub-agent runs WITHOUT the project's compact rules. This phase closes that loop — built once here, read cheaply at every delegation.
+
+**Input consumed**: the installed skills on disk (`state.skills.installed` + the agent skills dirs).
+**Output**: `.atl/skill-registry.md` (+ engram upsert if available) + `state.registry`.
+
+> Note on "Project Conventions": in this first foundation pass `CLAUDE.md`/`AGENTS.md` don't exist yet (Phase 5 generates them), so the registry's conventions section starts empty. That's fine — the compact rules (the critical output) are complete, and the orchestrator reads `CLAUDE.md` directly anyway. A later `/jr-orchestrator:registry` re-run indexes the conventions too.
+
+**Dispatch**:
+```
+Skill("skill-registry")
+```
+
+After completion: confirm `.atl/skill-registry.md` exists. Update state: `step = "agents"`. Proceed to Phase 5.
+
+### Phase 5: agent-instruction (LAST — needs KB + the registry)
+
+**Why last**: `agent-instruction` builds the Navigation Map (Mapa de Navegación) referencing all KB files (`state.kb.files`) and reads `.atl/skill-registry.md` as its **single source of truth for available skills**. It maps those skills to the project's agent roles and *references* the registry for the compact rules — it does NOT copy the rules into `CLAUDE.md` (those live only in the registry, which is not versioned). It also applies applicable rule snippets (`reglas/*.md`). All inputs exist only after Phases 1, 3 and 4 complete.
+
+**Input consumed**: `state.kb.discovery` + `state.kb.files` (reads `knowledge-base/`) + `.atl/skill-registry.md` (skills source of truth) + applicable rule snippets.
 **Output**: `CLAUDE.md` / `AGENTS.md` + `state.agents`.
 
 **Dispatch**:
@@ -259,6 +283,7 @@ npx skills list | grep <skill-name>
 | `roadmap-generator` | `JuanCruzRobledo/roadmap-generator` | public |
 | `find-skill` | `vercel-labs/skills` (third-party) | public |
 | `agent-instruction` | `JuanCruzRobledo/agent-instruction` | public |
+| `skill-registry` | `JuanCruzRobledo/skill-registry` | public |
 
 > Note: this skill lives at `JuanCruzRobledo/jr-orchestrator` (public). The legacy private repo `JuanCruzRobledo/jr-starter` is a different project and is not used by the stack.
 
@@ -278,7 +303,7 @@ When `step == "done"` (all phases complete or skipped):
    - List of files created, one-liner per file.
    - Any phases that were skipped and why.
    - Suggested next command: `/opsx:propose <primer-change-de-CHANGES.md>` (if CHANGES.md was generated) or the next logical action.
-3. Reminder: "Podés re-ejecutar fases individuales: `/jr-orchestrator:kb` para agregar dominios, `/jr-orchestrator:rules` para regenerar CLAUDE.md, `/jr-orchestrator:find-skill` para agregar skills."
+3. Reminder: "Podés re-ejecutar fases individuales: `/jr-orchestrator:kb` para agregar dominios, `/jr-orchestrator:rules` para regenerar CLAUDE.md, `/jr-orchestrator:find-skill` para agregar skills, `/jr-orchestrator:registry` para reconstruir el skill-registry después de instalar/quitar skills."
 
 ---
 
@@ -291,9 +316,10 @@ This table is the **frozen contract**. C-13b (`kb-creator`) and C-13c (`roadmap-
 | `kb-creator` | **Two sources (sub-skill decides)**: (a) **interactive** — Q&A discovery: system_type, scale, stack, problem, domains; (b) **ingest** — existing docs/specs/READMEs provided by the user | `knowledge-base/*.md` + `state.kb` (`discovery`, `source`, `files`) |
 | `roadmap-generator` | `state.kb.discovery` + `state.kb.files` (reads `knowledge-base/`) | `CHANGES.md` + `state.roadmap` |
 | `find-skill` | `{ stack, domains, problem }` derived from `state.kb.discovery` | recommendations table + `state.skills` |
-| `agent-instruction` | `state.kb.discovery` + `state.kb.files` (reads `knowledge-base/`) + `state.skills.installed` + applicable rule snippets | `CLAUDE.md` / `AGENTS.md` + `state.agents` |
+| `skill-registry` | installed skills on disk (`state.skills.installed` + agent skills dirs) | `.atl/skill-registry.md` (+ engram upsert) + `state.registry` |
+| `agent-instruction` | `state.kb.discovery` + `state.kb.files` (reads `knowledge-base/`) + `.atl/skill-registry.md` (skills source of truth) + applicable rule snippets | `CLAUDE.md` / `AGENTS.md` + `state.agents` |
 
-**Order constraint**: `kb-creator` runs FIRST (produces discovery + KB that everyone consumes). `agent-instruction` runs LAST (needs KB index + installed skills list).
+**Order constraint**: `kb-creator` runs FIRST (produces discovery + KB everyone consumes). `find-skill` installs the domain skills. `skill-registry` then scans them and distills compact rules into `.atl/skill-registry.md`. `agent-instruction` runs LAST — it consumes the registry as its single source of truth for available skills (no re-scan) and needs the KB index too.
 
 ---
 
