@@ -27,13 +27,13 @@ You are a **thin orchestrator**. Your ONLY jobs are:
 
 **You do NOT ask discovery questions.** Discovery is `kb-creator`'s domain.
 **You do NOT write knowledge-base files, CHANGES.md, or CLAUDE.md/AGENTS.md.** Those are sub-skill outputs.
-**You do NOT embed inline logic for any foundation phase.** If you find yourself doing that, stop — delegate.
+**You do NOT reimplement any foundation phase's logic yourself.** You route to its sub-skill — `Skill` for interactive phases (kb-creator, agent-instruction), `Agent` for mechanical ones. If you catch yourself writing the phase's logic, stop — route.
 
 ---
 
 ## Operating rules (non-negotiable)
 
-1. **NEVER write discovery, KB, roadmap, or agent-instruction logic inline.** Dispatch to sub-skills.
+1. **NEVER reimplement a phase's logic yourself** (discovery, KB, roadmap, rules). Always route to its sub-skill — `Skill` for interactive phases, `Agent` for mechanical ones.
 2. **NEVER ask the user strategic questions** (system_type, scale, stack, problem). Those questions belong to `kb-creator`.
 3. **Own `step` and nothing else.** Only write `version`, `step`, `owner` to the state. Sub-skills write their own sections.
 4. **Check sub-skill presence before dispatch.** If missing → offer install → degrade if declined.
@@ -148,7 +148,7 @@ Before branching: always load and apply resume logic above.
 
 4. Write initial state file:
    ```json
-   { "version": 2, "step": "kb", "owner": "jr-orchestrator" }
+   { "version": 3, "step": "kb", "owner": "jr-orchestrator" }
    ```
 
 5. Advance to Step 2.
@@ -157,7 +157,41 @@ Before branching: always load and apply resume logic above.
 
 ## Step 2 — Foundation flow dispatch (§4.2 order)
 
-Dispatch sub-skills in this exact order. Each dispatch is a `Skill` tool invocation (or `npx skills run <skill>` equivalent). **Never inline the phase logic.**
+Dispatch the foundation phases in this exact order. **The execution model is hybrid** — how each phase runs depends on whether it must talk to the user:
+
+| Phase | Runs | Why |
+|---|---|---|
+| kb-creator | **inline** (`Skill`) | Interactive — its discovery Q&A must reach the user; a sub-agent runs autonomously and cannot ask |
+| roadmap-generator | **sub-agent** (`Agent`) | Mechanical — reads the KB, writes `CHANGES.md`, no user interaction |
+| find-skill | **sub-agent** (`Agent`) | Mechanical — recommends + installs matching skills |
+| skill-registry | **sub-agent** (`Agent`) | Mechanical — heavy scan of every `SKILL.md` |
+| agent-instruction | **inline** (`Skill`) | Interactive — asks the user for the project's hard rules |
+
+**Why delegate the mechanical phases**: they read many files and emit large output. Running them inline would inflate the orchestrator's context and break its thin-coordinator constitution (*"delegate real work to sub-agents"*). **Why the interactive phases stay inline**: a sub-agent cannot prompt the user — delegating an interactive phase would silently drop its questions. So interactivity decides placement, not preference.
+
+**Never reimplement a phase's logic inline.** Mechanical phases delegate to a sub-agent that invokes the skill; interactive phases invoke the skill directly. Either way the skill does the work — the orchestrator only routes.
+
+**Sub-agent launch pattern** (mechanical phases) — use the `Agent` tool with a complete brief, since the sub-agent starts with NO context:
+
+```
+Agent({
+  description: "Foundation: <phase> for <project>",
+  model: "<model-routing: sonnet default>",
+  prompt: `
+    ## Task
+    Use the Skill tool to invoke \`<skill-name>\` for this project.
+    ## Context
+    - Shared state: .jr-orchestrator-state.json (read it for prior phases' output)
+    - Prior artifacts: <relevant paths — knowledge-base/, CHANGES.md, .atl/skill-registry.md>
+    ## Instructions
+    Follow the skill completely. When done, write your own section into
+    .jr-orchestrator-state.json and return a one-paragraph summary + the
+    artifact paths produced.
+  `
+})
+```
+
+After a sub-agent returns: read `.jr-orchestrator-state.json` to confirm its section was written, then advance `step`.
 
 Before each dispatch: check lazy-load (see Step 3 — Graceful Degradation).
 
@@ -171,7 +205,7 @@ Before each dispatch: check lazy-load (see Step 3 — Graceful Degradation).
 
 In both cases, `kb-creator` writes `state.kb` (including `state.kb.discovery`, `state.kb.source`, `state.kb.files`) and all `knowledge-base/*.md` files.
 
-**Dispatch**:
+**Dispatch** (inline — interactive, must reach the user):
 ```
 Skill("kb-creator")
 ```
@@ -185,24 +219,32 @@ Update state: `step = "roadmap"`.
 **Input consumed**: `state.kb.discovery` + `state.kb.files` (reads `knowledge-base/`).
 **Output**: `CHANGES.md` + `state.roadmap`.
 
-**Dispatch**:
+**Dispatch** (sub-agent — mechanical):
 ```
-Skill("roadmap-generator")
+Agent({
+  description: "Foundation: roadmap-generator",
+  model: "sonnet",
+  prompt: "Use the Skill tool to invoke `roadmap-generator`. Read .jr-orchestrator-state.json + knowledge-base/ for input. Produce CHANGES.md and write state.roadmap. Return a summary + the CHANGES.md path."
+})
 ```
 
-After completion: confirm `CHANGES.md` exists. Update state: `step = "find-skill"`.
+After the sub-agent returns: confirm `CHANGES.md` exists. Update state: `step = "find-skill"`.
 
 ### Phase 3: find-skill
 
 **Input consumed**: `{ stack, domains, problem }` derived from `state.kb.discovery`.
 **Output**: recommendations table + `state.skills` (recommended + installed lists).
 
-**Dispatch**:
+**Dispatch** (sub-agent — mechanical):
 ```
-Skill("find-skill")
+Agent({
+  description: "Foundation: find-skill",
+  model: "sonnet",
+  prompt: "Use the Skill tool to invoke `find-skill`. Derive { stack, domains, problem } from state.kb.discovery in .jr-orchestrator-state.json. Recommend + install matching skills, then write state.skills (recommended + installed). Return the recommendations table + installed list."
+})
 ```
 
-After completion: update state: `step = "registry"`.
+After the sub-agent returns: update state: `step = "registry"`.
 
 ### Phase 4: skill-registry (after find-skill — feeds both agent-instruction AND the SDD orchestrator)
 
@@ -215,21 +257,27 @@ After completion: update state: `step = "registry"`.
 
 > Note on "Project Conventions": in this first foundation pass `CLAUDE.md`/`AGENTS.md` don't exist yet (Phase 5 generates them), so the registry's conventions section starts empty. That's fine — the compact rules (the critical output) are complete, and the orchestrator reads `CLAUDE.md` directly anyway. A later `/jr-orchestrator:registry` re-run indexes the conventions too.
 
-**Dispatch**:
+**Dispatch** (sub-agent — mechanical):
 ```
-Skill("skill-registry")
+Agent({
+  description: "Foundation: skill-registry",
+  model: "sonnet",
+  prompt: "Use the Skill tool to invoke `skill-registry`. Scan the installed skills, build .atl/skill-registry.md with compact rules, write state.registry. Return a summary + confirm .atl/skill-registry.md exists."
+})
 ```
 
-After completion: confirm `.atl/skill-registry.md` exists. Update state: `step = "agents"`. Proceed to Phase 5.
+After the sub-agent returns: confirm `.atl/skill-registry.md` exists. Update state: `step = "agents"`. Proceed to Phase 5.
 
-### Phase 5: agent-instruction (LAST — needs KB + the registry)
+### Phase 5: agent-instruction (LAST — interactive; needs KB + the registry)
 
-**Why last**: `agent-instruction` builds the Navigation Map (Mapa de Navegación) referencing all KB files (`state.kb.files`) and reads `.atl/skill-registry.md` as its **single source of truth for available skills**. It maps those skills to the project's agent roles and *references* the registry for the compact rules — it does NOT copy the rules into `CLAUDE.md` (those live only in the registry, which is not versioned). It also applies applicable rule snippets (`reglas/*.md`). All inputs exist only after Phases 1, 3 and 4 complete.
+**Why last**: `agent-instruction` builds the Navigation Map (Mapa de Navegación) referencing all KB files (`state.kb.files`) and reads `.atl/skill-registry.md` as its **single source of truth for available skills**. It maps those skills to the project's agent roles and *references* the registry for the compact rules — it does NOT copy the rules into `CLAUDE.md` (those live only in the registry, which is not versioned). All inputs exist only after Phases 1, 3 and 4 complete.
 
-**Input consumed**: `state.kb.discovery` + `state.kb.files` (reads `knowledge-base/`) + `.atl/skill-registry.md` (skills source of truth) + applicable rule snippets.
-**Output**: `CLAUDE.md` / `AGENTS.md` + `state.agents`.
+**Why inline + interactive**: this phase **asks the user for the project's hard rules** (stack-aware — it proposes defaults from the detected stack and confirms), so it must run inline. It also generates a project `AGENTS.md`/`CLAUDE.md` that does **NOT repeat** the global `~/.claude/CLAUDE.md` the stack already installed — only project-specific instructions. A sub-agent could not ask the rules, so this phase is never delegated.
 
-**Dispatch**:
+**Input consumed**: `state.kb.discovery` + `state.kb.files` (reads `knowledge-base/`) + `.atl/skill-registry.md` (skills source of truth) + the user's confirmed hard rules + the global `~/.claude/CLAUDE.md` (to avoid duplication).
+**Output**: project `CLAUDE.md` / `AGENTS.md` + `state.agents`.
+
+**Dispatch** (inline — interactive, asks the user for the hard rules):
 ```
 Skill("agent-instruction")
 ```
