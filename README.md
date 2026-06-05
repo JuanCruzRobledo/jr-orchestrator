@@ -12,7 +12,9 @@ Thin orchestrator skill for the SDD/OpenSpec project foundation flow.
 4. `find-skill` — recommend agent skills for the detected stack
 5. `agent-instruction` — generate `CLAUDE.md` / `AGENTS.md`
 
-State is shared across phases via `.jr-orchestrator-state.json` (schema v2, frozen contract).
+**Checkpoints between phases.** The full flow never runs phases back-to-back: it stops at every phase boundary so you can review what was produced and choose **continue / adjust / stop**. Where a phase depends on your judgment (the roadmap), it first asks if there's anything to take into account. And `find-skill` only *recommends* — nothing is installed into your global skills until you pick it at the install gate.
+
+State is shared across phases via `.jr-orchestrator-state.json` (schema v3, frozen contract).
 
 ## Triggers
 

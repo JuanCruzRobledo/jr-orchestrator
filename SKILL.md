@@ -12,7 +12,7 @@ description: >
 license: MIT
 metadata:
   author: juancruzrobledo
-  version: "2.0"
+  version: "2.1"
 ---
 
 # jr-orchestrator — thin orchestrator
@@ -23,7 +23,8 @@ You are a **thin orchestrator**. Your ONLY jobs are:
 2. Manage the shared state file `.jr-orchestrator-state.json` — you own the file and the `step` field.
 3. Run `openspec init` (Step 1).
 4. Dispatch each foundation phase to its dedicated sub-skill in §4.2 order (Step 2).
-5. Apply graceful degradation when a sub-skill is missing (Step 3).
+5. **Hold a checkpoint at every phase boundary** — never run phases back-to-back without stopping (§ Inter-phase checkpoint protocol).
+6. Apply graceful degradation when a sub-skill is missing (Step 3).
 
 **You do NOT ask discovery questions.** Discovery is `kb-creator`'s domain.
 **You do NOT write knowledge-base files, CHANGES.md, or CLAUDE.md/AGENTS.md.** Those are sub-skill outputs.
@@ -39,6 +40,8 @@ You are a **thin orchestrator**. Your ONLY jobs are:
 4. **Check sub-skill presence before dispatch.** If missing → offer install → degrade if declined.
 5. **Resume by default.** If `.jr-orchestrator-state.json` exists with `step != "done"`, ask to resume or restart.
 6. **STOP and wait after each AskUserQuestion call.** Never assume the answer.
+7. **NEVER chain phases without a checkpoint.** Every phase boundary holds a checkpoint (§ Inter-phase checkpoint protocol). You never advance `step` to the next phase without the user's explicit "Continuar". This applies in the full flow (`/jr-orchestrator:init`); standalone single-phase commands run only their phase and stop.
+8. **NEVER install anything autonomously.** `find-skill` recommends; the user picks; only then you install. Installing into the user's global skills is a HIGH-governance side-effect — propose and wait.
 
 ---
 
@@ -151,7 +154,7 @@ Before branching: always load and apply resume logic above.
    { "version": 3, "step": "kb", "owner": "jr-orchestrator" }
    ```
 
-5. Advance to Step 2.
+5. **Checkpoint (post-phase advance gate):** confirm `openspec/` was scaffolded, then run the advance gate (§ Inter-phase checkpoint protocol → B). On "Continuar", advance to Step 2 (kb-creator). On "Parar", state is already persisted at `step = "kb"`.
 
 ---
 
@@ -163,13 +166,41 @@ Dispatch the foundation phases in this exact order. **The execution model is hyb
 |---|---|---|
 | kb-creator | **inline** (`Skill`) | Interactive — its discovery Q&A must reach the user; a sub-agent runs autonomously and cannot ask |
 | roadmap-generator | **sub-agent** (`Agent`) | Mechanical — reads the KB, writes `CHANGES.md`, no user interaction |
-| find-skill | **sub-agent** (`Agent`) | Mechanical — recommends + installs matching skills |
+| find-skill | **sub-agent** (`Agent`) | Mechanical — **recommends only**; the orchestrator runs the install gate and installs only what the user picks (never the sub-agent) |
 | skill-registry | **sub-agent** (`Agent`) | Mechanical — heavy scan of every `SKILL.md` |
 | agent-instruction | **inline** (`Skill`) | Interactive — asks the user for the project's hard rules |
 
 **Why delegate the mechanical phases**: they read many files and emit large output. Running them inline would inflate the orchestrator's context and break its thin-coordinator constitution (*"delegate real work to sub-agents"*). **Why the interactive phases stay inline**: a sub-agent cannot prompt the user — delegating an interactive phase would silently drop its questions. So interactivity decides placement, not preference.
 
 **Never reimplement a phase's logic inline.** Mechanical phases delegate to a sub-agent that invokes the skill; interactive phases invoke the skill directly. Either way the skill does the work — the orchestrator only routes.
+
+---
+
+### Inter-phase checkpoint protocol (non-negotiable)
+
+The full flow NEVER runs phases back-to-back. Between **every** phase boundary you hold a checkpoint. A phase is only "done" once the user says so. There are two checkpoint kinds; a phase may use one or both.
+
+**A. Pre-phase context gate** — *before* dispatching a phase whose output is shaped by the user's judgment, ask whether there's anything to take into account, then thread that answer into the sub-skill's brief. STOP and wait.
+
+- Applies to: **roadmap-generator** (the user may want a specific order, a change that must exist, something to exclude). Pre-phase free-text/`AskUserQuestion` prompt, e.g.:
+  > "Antes de generar el roadmap (`CHANGES.md`), ¿hay algo que quieras que tenga en cuenta? (prioridades, un change que sí o sí, algo a excluir, restricciones de orden…). Si no, decime *seguí* y lo genero tal cual sale de la KB."
+  - Pass the answer verbatim into the sub-agent prompt as an extra `## User constraints` block. If empty, note "sin restricciones extra".
+- Not needed for: **kb-creator** (its own discovery Q&A *is* the context gathering) and **agent-instruction** (it asks the hard rules internally).
+
+**B. Post-phase advance gate** — *after* a phase completes, before you touch `step`:
+
+1. Show a one-line summary of what was produced (files/paths/key decisions).
+2. `AskUserQuestion` (single-select): **"Fase `{phase}` lista. ¿Cómo seguimos?"**
+   - **"Continuar a `{next-phase}`"** → advance `step`, dispatch the next phase.
+   - **"Ajustar — re-correr `{phase}`"** → ask what to change, re-dispatch the SAME phase with that feedback, then gate again. Do NOT advance `step`.
+   - **"Parar acá"** → persist state at the current `step`, tell the user how to resume (`/jr-orchestrator:init`), and exit gracefully.
+3. STOP and wait. Advance `step` ONLY on "Continuar".
+
+This post-phase gate runs after **every** phase: `openspec init` → kb-creator → roadmap-generator → find-skill (install) → skill-registry → agent-instruction.
+
+> Standalone single-phase commands (`/jr-orchestrator:kb`, `:rules`, `:find-skill`, `:registry`, `:openspec`) run ONLY their phase and stop — they don't chain, so they don't need the advance gate (the user already chose one phase). The checkpoint protocol governs the **full flow** (`/jr-orchestrator:init`).
+
+---
 
 **Sub-agent launch pattern** (mechanical phases) — use the `Agent` tool with a complete brief, since the sub-agent starts with NO context:
 
@@ -210,41 +241,60 @@ In both cases, `kb-creator` writes `state.kb` (including `state.kb.discovery`, `
 Skill("kb-creator")
 ```
 
-After kb-creator completes: read `.jr-orchestrator-state.json`; confirm `state.kb.discovery` and `state.kb.files` are populated. If not populated (skip was recorded), proceed to Phase 2 but note that downstream sub-skills will have incomplete input.
+After kb-creator completes: read `.jr-orchestrator-state.json`; confirm `state.kb.discovery` and `state.kb.files` are populated. If not populated (skip was recorded), note that downstream sub-skills will have incomplete input.
 
-Update state: `step = "roadmap"`.
+**Checkpoint (post-phase advance gate):** summarize the KB files produced, then run the advance gate (§ Inter-phase checkpoint protocol → B). Advance `step = "roadmap"` ONLY on "Continuar".
 
 ### Phase 2: roadmap-generator
 
-**Input consumed**: `state.kb.discovery` + `state.kb.files` (reads `knowledge-base/`).
+**Input consumed**: `state.kb.discovery` + `state.kb.files` (reads `knowledge-base/`) + the user's pre-phase constraints (below).
 **Output**: `CHANGES.md` + `state.roadmap`.
 
-**Dispatch** (sub-agent — mechanical):
+**Checkpoint (pre-phase context gate):** BEFORE dispatching, ask the user (§ Inter-phase checkpoint protocol → A):
+> "Antes de generar el roadmap (`CHANGES.md`), ¿hay algo que quieras que tenga en cuenta? (prioridades, un change que sí o sí, algo a excluir, restricciones de orden…). Si no, decime *seguí* y lo genero tal cual sale de la KB."
+
+STOP and wait. Capture the answer as `{user-constraints}` (or "sin restricciones extra" if empty).
+
+**Dispatch** (sub-agent — mechanical) — thread the constraints into the brief:
 ```
 Agent({
   description: "Foundation: roadmap-generator",
   model: "sonnet",
-  prompt: "Use the Skill tool to invoke `roadmap-generator`. Read .jr-orchestrator-state.json + knowledge-base/ for input. Produce CHANGES.md and write state.roadmap. Return a summary + the CHANGES.md path."
+  prompt: `Use the Skill tool to invoke \`roadmap-generator\`. Read .jr-orchestrator-state.json + knowledge-base/ for input. Produce CHANGES.md and write state.roadmap. Return a summary + the CHANGES.md path.
+
+  ## User constraints (honor these when ordering/scoping the changes)
+  {user-constraints}`
 })
 ```
 
-After the sub-agent returns: confirm `CHANGES.md` exists. Update state: `step = "find-skill"`.
+After the sub-agent returns: confirm `CHANGES.md` exists.
+
+**Checkpoint (post-phase advance gate):** summarize the changes/critical path produced, then run the advance gate. Advance `step = "find-skill"` ONLY on "Continuar". On "Ajustar", re-dispatch with the user's new constraints.
 
 ### Phase 3: find-skill
 
 **Input consumed**: `{ stack, domains, problem }` derived from `state.kb.discovery`.
 **Output**: recommendations table + `state.skills` (recommended + installed lists).
 
-**Dispatch** (sub-agent — mechanical):
+> **Hard rule — never auto-install.** Installing into the user's global skills mutates their environment (HIGH governance). `find-skill` defaults to `npx skills add … -y`, which silently skips its own confirmation. So you dispatch it in **recommend-only** mode and own the install decision yourself. The user picks; only then you install.
+
+**Step 3a — dispatch in RECOMMEND-ONLY mode** (sub-agent — mechanical):
 ```
 Agent({
-  description: "Foundation: find-skill",
+  description: "Foundation: find-skill (recommend-only)",
   model: "sonnet",
-  prompt: "Use the Skill tool to invoke `find-skill`. Derive { stack, domains, problem } from state.kb.discovery in .jr-orchestrator-state.json. Recommend + install matching skills, then write state.skills (recommended + installed). Return the recommendations table + installed list."
+  prompt: "Use the Skill tool to invoke `find-skill`. Derive { stack, domains, problem } from state.kb.discovery in .jr-orchestrator-state.json. RECOMMEND ONLY — DO NOT install anything, DO NOT run `npx skills add`. Return the full recommendations table (skill name, repo/source, install count, one-line why-it-matches). Write state.skills.recommended with the full list; leave state.skills.installed = []."
 })
 ```
 
-After the sub-agent returns: update state: `step = "registry"`.
+**Step 3b — install gate (you, the orchestrator):** present the recommendations table, then ask via `AskUserQuestion` (**`multiSelect: true`**):
+> "Encontré estas skills para tu stack. ¿Cuáles instalo? (podés elegir varias, o ninguna)"
+
+One option per recommended skill. STOP and wait. The user may pick all, some, or none.
+
+**Step 3c — install ONLY the picks (you, the orchestrator):** for each selected skill run `npx skills add <repo> --skill <name> -g` (drop `-y` if you want its own prompt too; the user already confirmed here). Then write `state.skills.installed` = only the picked skills. If the user picked none, leave it `[]` and note it.
+
+**Checkpoint (post-phase advance gate):** summarize what was installed (or "ninguna"), then run the advance gate. Advance `step = "registry"` ONLY on "Continuar".
 
 ### Phase 4: skill-registry (after find-skill — feeds both agent-instruction AND the SDD orchestrator)
 
@@ -266,7 +316,9 @@ Agent({
 })
 ```
 
-After the sub-agent returns: confirm `.atl/skill-registry.md` exists. Update state: `step = "agents"`. Proceed to Phase 5.
+After the sub-agent returns: confirm `.atl/skill-registry.md` exists.
+
+**Checkpoint (post-phase advance gate):** summarize the registry built (skill count, path), then run the advance gate. Advance `step = "agents"` ONLY on "Continuar". Proceed to Phase 5.
 
 ### Phase 5: agent-instruction (LAST — interactive; needs KB + the registry)
 
@@ -282,7 +334,7 @@ After the sub-agent returns: confirm `.atl/skill-registry.md` exists. Update sta
 Skill("agent-instruction")
 ```
 
-After completion: update state: `step = "done"`. Proceed to Step 4 (summary).
+After completion: this is the LAST phase, so there's no "next phase" to gate into — but still confirm closure. Summarize the `CLAUDE.md`/`AGENTS.md` produced, then `AskUserQuestion`: "Fundación completa. ¿Cerramos (`step = done`) o querés ajustar las reglas/CLAUDE.md?" — on "ajustar", re-dispatch `agent-instruction`; on "cerrar", update state `step = "done"` and proceed to Step 4 (summary).
 
 ---
 
@@ -391,6 +443,8 @@ This table is the **frozen contract**. C-13b (`kb-creator`) and C-13c (`roadmap-
 - Does NOT port templates (`templates/kb/*`, `templates/reglas/*`, docker-compose) — those feed the sub-skills in C-13b/c, not the orchestrator.
 - Does NOT commit or push (unless explicitly asked).
 - Does NOT install project dependencies (`npm install`, `pip install`, etc.).
+- Does NOT install skills autonomously. `find-skill` only recommends; the user picks at the install gate (§ Phase 3) before anything is added to the global skills.
+- Does NOT chain phases silently. Every phase boundary holds a checkpoint (§ Inter-phase checkpoint protocol); `step` never advances without the user's explicit "Continuar".
 
 ---
 
