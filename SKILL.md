@@ -149,12 +149,22 @@ Before branching: always load and apply resume logic above.
    openspec init
    ```
 
-4. Write initial state file:
+4. Cleanup of redundant scaffolding. `openspec init` unconditionally drops
+   `<project>/.claude/skills/openspec-*` dirs — redundant copies of skills that
+   already ship globally in the stack. Remove them immediately after init (the glob
+   is future-proof: any new `openspec-*` dir added by `openspec init` later is
+   covered automatically). Do NOT touch `.claude/commands/opsx/` — that is the
+   slash-command delivery and must stay intact.
+   ```bash
+   rm -rf .claude/skills/openspec-*
+   ```
+
+5. Write initial state file:
    ```json
    { "version": 3, "step": "kb", "owner": "jr-orchestrator" }
    ```
 
-5. **Checkpoint (post-phase advance gate):** confirm `openspec/` was scaffolded, then run the advance gate (§ Inter-phase checkpoint protocol → B). On "Continuar", advance to Step 2 (kb-creator). On "Parar", state is already persisted at `step = "kb"`.
+6. **Checkpoint (post-phase advance gate):** confirm `openspec/` was scaffolded, then run the advance gate (§ Inter-phase checkpoint protocol → B). On "Continuar", advance to Step 2 (kb-creator). On "Parar", state is already persisted at `step = "kb"`.
 
 ---
 
