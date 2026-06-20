@@ -136,6 +136,8 @@ Before branching: always load and apply resume logic above.
 
 ## Step 1 — openspec init
 
+> **0. Pin the Engram project name FIRST (if the project uses Engram).** Before any `mem_save` happens in the foundation flow, ensure `.engram/config.json` pins the canonical `project_name` — otherwise every foundation memory scatters under the wrong name (basename vs git remote) and becomes unfindable. One-liner (confirm the name with the user if the git remote differs from the basename): `mkdir -p .engram && printf '{ "project_name": "%s" }\n' "$(basename "$PWD")" > .engram/config.json`. Full logic in the `engram-protocol` skill's PROJECT NAME GUARD.
+
 1. Verify `openspec` CLI is available:
    ```bash
    openspec --version
